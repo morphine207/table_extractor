@@ -15,6 +15,8 @@ class Settings(BaseModel):
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
     pdf_render_dpi: int = int(os.getenv("PDF_RENDER_DPI", "300"))
+    # Comma-separated list of allowed origins, e.g.:
+    #   CORS_ALLOW_ORIGINS=https://<your-swa>.azurestaticapps.net,https://www.yourdomain.com
     cors_allow_origins: list[str] = (
         [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
         if os.getenv("CORS_ALLOW_ORIGINS")

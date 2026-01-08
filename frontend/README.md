@@ -54,4 +54,4 @@ This project is built with:
 
 ## How can I deploy this project?
 
-Build and deploy the `dist/` output from `npm run build` to your hosting provider of choice.
+Build and deploy the `build/` output from `npm run build` to your hosting provider of choice.

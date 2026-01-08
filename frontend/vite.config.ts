@@ -15,6 +15,11 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
+  build: {
+    // Azure Static Web Apps config in this repo expects `/build`
+    outDir: "build",
+    emptyOutDir: true,
+  },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   resolve: {
     alias: {
