@@ -1,0 +1,15 @@
+pandas
+numpy
+Pillow
+google-genai
+fastapi
+uvicorn
+sqlalchemy
+alembic
+python-multipart
+pydantic
+python-dotenv
+PyPDF2
+pymupdf
+jinja2
+openpyxl
