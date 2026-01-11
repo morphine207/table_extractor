@@ -62,6 +62,9 @@ async def upload_document(
             document_id=document_id,
             pdf_bytes=pdf_bytes,
             pdf_password=pdf_password,
+            chunk_height=settings.default_chunk_height,
+            overlap=settings.default_overlap,
+            prompt=settings.gemini_prompt,
         )
     )
 

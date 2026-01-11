@@ -12,6 +12,11 @@ pip install -r requirements.txt
 
 - **Configure** (copy `env.example` to `.env` if your environment supports it, or export vars):
   - `GEMINI_API_KEY=...`
+  - Optional performance knobs (see `env.example`):
+    - `PDF_RENDER_DPI` (lower = faster)
+    - `GEMINI_CONCURRENCY` (small parallelism helps; too high may 429)
+    - `CHUNK_HEIGHT`, `CHUNK_OVERLAP` (fewer chunks = fewer model calls)
+    - `SAVE_CHUNK_IMAGES`, `SAVE_RAW_CHUNKS` (keep off unless debugging)
 
 - **Run**:
 

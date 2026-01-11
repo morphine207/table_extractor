@@ -32,13 +32,39 @@ def _utc_iso() -> str:
 
 
 def _write_json(path: str, payload: object) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _save_png(img: Image.Image, path: str) -> None:
+def _write_bytes(path: str, data: bytes) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    img.save(path, format="PNG")
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text or "")
+
+
+def _save_png(img: Image.Image, path: str, *, compress_level: int = 1) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Lower compression = faster CPU, larger files (good tradeoff for pipelines).
+    img.save(path, format="PNG", compress_level=int(compress_level))
+
+
+def _downscale_for_gemini(img: Image.Image) -> Image.Image:
+    """
+    Reduce image size before sending to the model. This improves latency and reduces upload cost.
+    """
+    max_w = int(getattr(settings, "max_chunk_width", 0) or 0)
+    if max_w <= 0 or img.width <= max_w:
+        return img
+    ratio = max_w / float(img.width)
+    new_h = max(1, int(round(img.height * ratio)))
+    return img.resize((max_w, new_h), Image.LANCZOS)
 
 
 def _row_bbox_for_chunk(*, page_width: int, top: int, bottom: int, idx: int, n: int) -> dict:
@@ -103,9 +129,8 @@ class DocumentProcessor:
 
             self.progress.update(document_id, state="processing", message=None)
 
-            # Save original
-            with open(paths.pdf_path, "wb") as f:
-                f.write(pdf_bytes)
+            # Save original (off the event loop)
+            await asyncio.to_thread(_write_bytes, paths.pdf_path, pdf_bytes)
 
             images = pdf_to_images(pdf_bytes, password=pdf_password, dpi=settings.pdf_render_dpi)
             total_pages = len(images)
@@ -131,7 +156,9 @@ class DocumentProcessor:
 
             chunk_counter = 0
 
-            async def _extract_with_retries(img: Image.Image) -> str:
+            sem = asyncio.Semaphore(max(1, int(getattr(settings, "gemini_concurrency", 1) or 1)))
+
+            async def _extract_with_retries(img: Image.Image, *, chunk_label: str) -> str:
                 max_attempts = 6
                 base_wait = 2.0
                 last_err: Exception | None = None
@@ -150,7 +177,10 @@ class DocumentProcessor:
                         # Update status so frontend doesn't look "stuck"
                         self.progress.update(
                             document_id,
-                            message=f"Rate limited by Gemini. Retrying in {wait_s:.0f}s (attempt {attempt}/{max_attempts})…",
+                            message=(
+                                f"Rate limited by Gemini ({chunk_label}). Retrying in {wait_s:.0f}s "
+                                f"(attempt {attempt}/{max_attempts})…"
+                            ),
                         )
                         await asyncio.sleep(wait_s)
 
@@ -161,9 +191,15 @@ class DocumentProcessor:
             for page_idx, page_img in enumerate(images, start=1):
                 self.progress.update(document_id, current_page=page_idx, current_chunk=None)
 
-                # Save page image
-                page_path = os.path.join(paths.pages_dir, f"{page_idx}.png")
-                _save_png(page_img, page_path)
+                # Save page image (optional; kept ON by default because /pages/{n}/image serves it)
+                if getattr(settings, "save_page_images", True):
+                    page_path = os.path.join(paths.pages_dir, f"{page_idx}.png")
+                    await asyncio.to_thread(
+                        _save_png,
+                        page_img,
+                        page_path,
+                        compress_level=int(getattr(settings, "png_compress_level", 1) or 1),
+                    )
 
                 header: list[str] | None = None
                 page_rows: list[list[str]] = []
@@ -172,29 +208,61 @@ class DocumentProcessor:
                 chunks = per_page_chunks[page_idx - 1]
                 page_width, _page_height = page_img.size
 
+                async def _extract_one_chunk(chunk) -> tuple[int, str]:
+                    # Optional: persist chunk image (very expensive; OFF by default)
+                    if getattr(settings, "save_chunk_images", False):
+                        chunk_dir = os.path.join(paths.chunks_dir, f"page_{page_idx}")
+                        chunk_img_path = os.path.join(chunk_dir, f"chunk_{chunk.chunk_index}.png")
+                        await asyncio.to_thread(
+                            _save_png,
+                            chunk.image,
+                            chunk_img_path,
+                            compress_level=int(getattr(settings, "png_compress_level", 1) or 1),
+                        )
+
+                    img_for_gemini = _downscale_for_gemini(chunk.image)
+
+                    async with sem:
+                        txt = await _extract_with_retries(
+                            img_for_gemini,
+                            chunk_label=f"page {page_idx} chunk {chunk.chunk_index}",
+                        )
+
+                    # Optional: persist raw model output (expensive; OFF by default)
+                    if getattr(settings, "save_raw_chunks", False):
+                        raw_dir = os.path.join(paths.raw_dir, f"page_{page_idx}")
+                        raw_path = os.path.join(raw_dir, f"chunk_{chunk.chunk_index}.txt")
+                        await asyncio.to_thread(_write_text, raw_path, txt)
+
+                    return int(chunk.chunk_index), (txt or "")
+
+                # 1) Extract text for all chunks with bounded parallelism.
+                tasks = [asyncio.create_task(_extract_one_chunk(c)) for c in chunks]
+                chunk_text_by_index: dict[int, str] = {}
+                try:
+                    for fut in asyncio.as_completed(tasks):
+                        idx, txt = await fut
+                        chunk_text_by_index[idx] = txt
+                        chunk_counter += 1
+                        self.progress.update(
+                            document_id,
+                            current_chunk=idx,
+                            progress=int(round((chunk_counter / max(1, total_chunks)) * 100)),
+                        )
+                except Exception:
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+                finally:
+                    self.progress.update(document_id, current_chunk=None)
+
+                # 2) Parse/merge sequentially in chunk order for stable dedupe behavior.
                 for chunk in chunks:
-                    self.progress.update(document_id, current_chunk=chunk.chunk_index)
-
-                    # Persist chunk image
-                    chunk_dir = os.path.join(paths.chunks_dir, f"page_{page_idx}")
-                    os.makedirs(chunk_dir, exist_ok=True)
-                    chunk_img_path = os.path.join(chunk_dir, f"chunk_{chunk.chunk_index}.png")
-                    _save_png(chunk.image, chunk_img_path)
-
-                    # Call Gemini (with retries for 429/quota)
-                    chunk_text = await _extract_with_retries(chunk.image)
-
-                    raw_dir = os.path.join(paths.raw_dir, f"page_{page_idx}")
-                    os.makedirs(raw_dir, exist_ok=True)
-                    with open(os.path.join(raw_dir, f"chunk_{chunk.chunk_index}.txt"), "w", encoding="utf-8") as f:
-                        f.write(chunk_text or "")
+                    chunk_text = chunk_text_by_index.get(int(chunk.chunk_index), "") or ""
 
                     parsed = parse_extracted_text(chunk_text, delimiter="|")
                     if not parsed:
-                        chunk_counter += 1
-                        self.progress.update(
-                            document_id, progress=int(round((chunk_counter / max(1, total_chunks)) * 100))
-                        )
                         continue
 
                     if header is None:
@@ -234,9 +302,6 @@ class DocumentProcessor:
                             }
                         )
 
-                    chunk_counter += 1
-                    self.progress.update(document_id, progress=int(round((chunk_counter / max(1, total_chunks)) * 100)))
-
                 if header is None:
                     header = []
 
@@ -249,7 +314,11 @@ class DocumentProcessor:
                     "row_metadata": page_row_meta,
                     "generated_at": _utc_iso(),
                 }
-                _write_json(os.path.join(paths.tables_dir, f"page_{page_idx}.json"), page_table_payload)
+                await asyncio.to_thread(
+                    _write_json,
+                    os.path.join(paths.tables_dir, f"page_{page_idx}.json"),
+                    page_table_payload,
+                )
 
                 # Append to global
                 if global_header is None and header:
@@ -272,7 +341,7 @@ class DocumentProcessor:
                 "rows": global_rows,
                 "generated_at": _utc_iso(),
             }
-            _write_json(os.path.join(paths.tables_dir, "global.json"), global_payload)
+            await asyncio.to_thread(_write_json, os.path.join(paths.tables_dir, "global.json"), global_payload)
 
             self.progress.update(document_id, state="completed", current_chunk=None, current_page=None, progress=100, message=None)
         except Exception as e:
